@@ -1,94 +1,93 @@
-import pandas as pd
+from dataclasses import dataclass
+from typing import Literal
 import numpy as np
-import matplotlib.pyplot as plt
-from base import DecisionTree
-from metrics import *
-from sklearn.datasets import make_classification
-from sklearn.model_selection import train_test_split, KFold
-
-np.random.seed(42)
-
-# Dataset generation
-
-X, y = make_classification(
-    n_features=2, n_redundant=0, n_informative=2,
-    random_state=1, n_clusters_per_class=2, class_sep=0.5
-)
-
-# Convert to pandas for our custom tree
-X = pd.DataFrame(X, columns=["x1", "x2"])
-y = pd.Series(y, dtype="category")
-
-# Plot dataset
-plt.scatter(X["x1"], X["x2"], c=y)
-plt.title("Generated dataset")
-plt.show()
+import pandas as pd
+from utils import *
 
 
-# Q2 (a) Train/test split 70/30
-
-def train_and_evaluate(X, y, max_depth=5):
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.3, random_state=42, stratify=y
-    )
-
-    tree = DecisionTree(criterion="information_gain", max_depth=max_depth)
-    tree.fit(X_train, y_train)
-    y_pred = tree.predict(X_test)
-
-    print("=== Q2 (a) Train/Test Split ===")
-    print("Accuracy:", accuracy(y_pred, y_test))
-    for cls in y_test.unique():
-        print(f"Class {cls}: Precision={precision(y_pred, y_test, cls)}, Recall={recall(y_pred, y_test, cls)}")
+class Node:
+    def __init__(self, feature=None, threshold=None, left=None, right=None, output=None):
+        self.feature = feature
+        self.threshold = threshold   # threshold for regression splits
+        self.left = left
+        self.right = right
+        self.output = output
 
 
-# Q2 (b) Nested cross-validation
+@dataclass
+class DecisionTree:
+    criterion: Literal["information_gain", "gini_index"]  # classification only
+    max_depth: int = 5
 
-def nested_cross_validation(X, y, depths=range(1, 11), outer_splits=5):
-    outer_cv = KFold(n_splits=outer_splits, shuffle=True, random_state=42)
-    best_depths = []
-    outer_accuracies = []
+    def __init__(self, criterion, max_depth=5):
+        self.criterion = criterion
+        self.max_depth = max_depth
+        self.root = None
+        self.is_regression = False
 
-    for fold, (train_idx, test_idx) in enumerate(outer_cv.split(X), 1):
-        X_train, X_test = X.iloc[train_idx], X.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
+    def fit(self, X: pd.DataFrame, y: pd.Series) -> None:
+        self.is_regression = check_ifreal(y)
+        self.root = self._build_tree(X, y, depth=0)
 
-        inner_cv = KFold(n_splits=4, shuffle=True, random_state=42)
-        avg_scores = {}
+    def _build_tree(self, X, y, depth):
+        if len(np.unique(y)) == 1 or depth >= self.max_depth or X.empty:
+            return Node(output=y.mean() if self.is_regression else y.mode()[0])
 
-        for d in depths:
-            scores = []
-            for inner_train_idx, inner_val_idx in inner_cv.split(X_train):
-                X_inner_train, X_val = X_train.iloc[inner_train_idx], X_train.iloc[inner_val_idx]
-                y_inner_train, y_val = y_train.iloc[inner_train_idx], y_train.iloc[inner_val_idx]
+        features = X.columns
+        crit = "mse" if self.is_regression else self.criterion
+        best_attr = opt_split_attribute(X, y, crit, features)
 
-                tree = DecisionTree(criterion="information_gain", max_depth=d)
-                tree.fit(X_inner_train, y_inner_train)
-                preds = tree.predict(X_val)
-                scores.append(accuracy(preds, y_val))
+        if best_attr is None:
+            return Node(output=y.mean() if self.is_regression else y.mode()[0])
 
-            avg_scores[d] = np.mean(scores)
+        if self.is_regression:
+            # choose threshold = median for continuous regression splits
+            best_value = X[best_attr].median()
+            X_left, y_left = X[X[best_attr] <= best_value], y[X[best_attr] <= best_value]
+            X_right, y_right = X[X[best_attr] > best_value], y[X[best_attr] > best_value]
+        else:
+            # classification split: mode-based equality
+            best_value = X[best_attr].mode()[0]
+            X_left, y_left, X_right, y_right = split_data(X, y, best_attr, best_value)
 
-        # pick best depth for this fold
-        best_d = max(avg_scores, key=avg_scores.get)
-        best_depths.append(best_d)
+        left_child = self._build_tree(X_left, y_left, depth + 1) if not y_left.empty else None
+        right_child = self._build_tree(X_right, y_right, depth + 1) if not y_right.empty else None
 
-        # retrain with best_d
-        best_tree = DecisionTree(criterion="information_gain", max_depth=best_d)
-        best_tree.fit(X_train, y_train)
-        final_preds = best_tree.predict(X_test)
-        final_acc = accuracy(final_preds, y_test)
-        outer_accuracies.append(final_acc)
+        return Node(feature=best_attr, threshold=best_value, left=left_child, right=right_child)
 
-        print(f"Fold {fold}: Best depth = {best_d}, Accuracy = {final_acc}")
+    def _predict_row(self, row, node: Node):
+        if node.output is not None:
+            return node.output
 
-    opt_depth = max(set(best_depths), key=best_depths.count)
-    print("\n=== Q2 (b) Nested CV Results ===")
-    print("Per-fold accuracies:", outer_accuracies)
-    print("Average accuracy:", np.mean(outer_accuracies))
-    print("Optimum depth (most frequent):", opt_depth)
+        if self.is_regression:
+            if row[node.feature] <= node.threshold:
+                return self._predict_row(row, node.left) if node.left else node.output
+            else:
+                return self._predict_row(row, node.right) if node.right else node.output
+        else:
+            if row[node.feature] == node.threshold:
+                return self._predict_row(row, node.left) if node.left else node.output
+            else:
+                return self._predict_row(row, node.right) if node.right else node.output
 
-# Run experiments
+    def predict(self, X: pd.DataFrame) -> pd.Series:
+        return X.apply(lambda row: self._predict_row(row, self.root), axis=1)
 
-train_and_evaluate(X, y)
-nested_cross_validation(X, y)
+    def _print_tree(self, node, depth=0):
+        if node is None:
+            return
+        indent = "    " * depth
+        if node.output is not None:
+            print(f"{indent}Output: {node.output}")
+        else:
+            if self.is_regression:
+                print(f"{indent}?({node.feature} <= {node.threshold:.3f})")
+            else:
+                print(f"{indent}?({node.feature} == {node.threshold})")
+            print(f"{indent}Y:")
+            self._print_tree(node.left, depth + 1)
+            print(f"{indent}N:")
+            self._print_tree(node.right, depth + 1)
+
+    def plot(self):
+        self._print_tree(self.root)
